@@ -1,0 +1,6 @@
+{
+  "name": "@plataforma/ui",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Sistema de diseño compartido (Tailwind). Componentes se agregan al iniciar los frontends."
+}

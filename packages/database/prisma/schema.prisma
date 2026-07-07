@@ -1,0 +1,342 @@
+// Esquema de la Plataforma de Pagos Escolares
+// PostgreSQL es la ÚNICA fuente de verdad financiera (instrucciones sección 4).
+// Reglas del ledger (sección 6.3):
+//   - Registros financieros confirmados nunca se editan ni borran; correcciones por contra-asientos.
+//   - El saldo de una familia SIEMPRE se calcula: cargos - aplicaciones. Nunca es un campo editable.
+//   - Montos en centavos como enteros (BigInt). Moneda explícita en cada registro.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+// ENUMS: máquinas de estados (sección 6.2)
+// Las transiciones válidas se validan en la capa de servicio
+// (packages/shared/src/state-machines.ts). Transición inválida = error + auditoría.
+// ============================================================
+
+enum ChargeStatus {
+  SCHEDULED // programado (generado por plantilla, aún no exigible)
+  ISSUED // emitido (exigible, visible al padre)
+  PARTIALLY_PAID // parcialmente pagado
+  PAID // pagado
+  OVERDUE // vencido
+  CANCELLED // cancelado
+}
+
+enum PaymentStatus {
+  PENDING // pendiente de confirmación del procesador
+  CONFIRMED // confirmado
+  FAILED // fallido
+  REFUNDED // reembolsado
+}
+
+enum InvoiceStatus {
+  PENDING // pendiente de timbrado
+  STAMPED // timbrada ante el SAT
+  FAILED // timbrado fallido (va a bandeja de excepciones)
+  CANCELLED // cancelada
+}
+
+// Toda obligación de pago es un Charge; se distinguen por concept_type,
+// nunca por tablas separadas (sección 6.1).
+enum ConceptType {
+  TUITION // colegiatura
+  ENROLLMENT // inscripción
+  TRANSPORT // transporte
+  LATE_FEE // recargo
+  MATERIALS // materiales
+  OTHER // otro
+}
+
+enum PaymentMethod {
+  SPEI // transferencia a CLABE virtual de la familia
+  CARD // tarjeta vía checkout tokenizado
+  CASH // efectivo referenciado
+  MANUAL // registrado manualmente por el administrador
+}
+
+enum EducationLevel {
+  PRESCHOOL // preescolar
+  PRIMARY // primaria
+  SECONDARY // secundaria
+  HIGH_SCHOOL // preparatoria
+}
+
+enum GuardianRelationship {
+  MOTHER
+  FATHER
+  GRANDPARENT
+  LEGAL_GUARDIAN
+  OTHER
+}
+
+// Estado de procesamiento del evento crudo de webhook (sección 7.3).
+enum PaymentEventStatus {
+  RECEIVED // persistido, pendiente de encolar
+  QUEUED // encolado en BullMQ
+  PROCESSED // aplicado con éxito
+  FAILED // falló; permite reintento manual desde el panel
+  DISCARDED // duplicado descartado por unicidad (provider, provider_event_id)
+}
+
+// ============================================================
+// ENTIDADES NÚCLEO DEL MVP (sección 6.1)
+// Multitenencia desde el día uno: todo registro financiero incluye tenant_id.
+// ============================================================
+
+// Escuela. Existe desde el día uno aunque solo haya una (Instituto JFR).
+model Tenant {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String
+  slug      String   @unique // identificador legible, ej. "instituto-jfr"
+  rvoe      String? // clave RVOE, requerida para el complemento IEDU (Fase 2)
+  rfc       String? // RFC de la escuela como emisor de CFDI
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  families  Family[]
+  guardians Guardian[]
+  students  Student[]
+  charges   Charge[]
+  payments  Payment[]
+  invoices  Invoice[]
+  auditLogs AuditLog[]
+
+  @@map("tenants")
+}
+
+// La FAMILIA es la unidad de cobro, no el alumno (sección 3).
+// Un padre con tres hijos ve un solo saldo consolidado y una sola CLABE.
+model Family {
+  id           String   @id @default(uuid()) @db.Uuid
+  tenantId     String   @map("tenant_id") @db.Uuid
+  familyCode   String   @map("family_code") // código legible, ej. "FAM-0001"
+  displayName  String   @map("display_name") // ej. "Familia García Hernández"
+  virtualClabe String?  @map("virtual_clabe") // CLABE virtual permanente (se asigna en Fase 2)
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  tenant    Tenant     @relation(fields: [tenantId], references: [id])
+  guardians Guardian[]
+  students  Student[]
+  charges   Charge[]
+  payments  Payment[]
+
+  @@unique([tenantId, familyCode])
+  @@index([tenantId])
+  @@index([virtualClabe])
+  @@map("families")
+}
+
+// Tutor. Nunca necesita contraseña: acceso por liga mágica (sección 3).
+model Guardian {
+  id           String               @id @default(uuid()) @db.Uuid
+  tenantId     String               @map("tenant_id") @db.Uuid
+  familyId     String               @map("family_id") @db.Uuid
+  firstName    String               @map("first_name")
+  lastName     String               @map("last_name")
+  // Teléfono normalizado E.164, ej. "+524421234567" (sección 6.1)
+  phoneE164    String?              @map("phone_e164")
+  email        String?
+  relationship GuardianRelationship @default(OTHER)
+  // Datos fiscales opcionales: se piden UNA sola vez y se reutilizan (sección 8)
+  rfc          String?
+  taxRegime    String?              @map("tax_regime") // régimen fiscal SAT, ej. "605"
+  taxZipCode   String?              @map("tax_zip_code") // CP del domicilio fiscal
+  isPrimary    Boolean              @default(false) @map("is_primary") // contacto principal de cobranza
+  createdAt    DateTime             @default(now()) @map("created_at")
+  updatedAt    DateTime             @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  family Family @relation(fields: [familyId], references: [id])
+
+  @@index([tenantId])
+  @@index([familyId])
+  @@index([phoneE164])
+  @@index([email])
+  @@map("guardians")
+}
+
+model Student {
+  id             String         @id @default(uuid()) @db.Uuid
+  tenantId       String         @map("tenant_id") @db.Uuid
+  familyId       String         @map("family_id") @db.Uuid
+  firstName      String         @map("first_name")
+  lastName       String         @map("last_name")
+  // CURP validada por formato en la importación; bloquea timbrado si es inválida (sección 8)
+  curp           String?
+  enrollmentId   String         @map("enrollment_id") // matrícula
+  educationLevel EducationLevel @map("education_level")
+  grade          String // ej. "3"
+  groupName      String?        @map("group_name") // ej. "B"
+  // Beca como porcentaje en puntos base (2500 = 25.00%) para evitar flotantes
+  scholarshipBps Int            @default(0) @map("scholarship_bps")
+  isActive       Boolean        @default(true) @map("is_active")
+  createdAt      DateTime       @default(now()) @map("created_at")
+  updatedAt      DateTime       @updatedAt @map("updated_at")
+
+  tenant  Tenant   @relation(fields: [tenantId], references: [id])
+  family  Family   @relation(fields: [familyId], references: [id])
+  charges Charge[]
+
+  @@unique([tenantId, enrollmentId])
+  @@index([tenantId])
+  @@index([familyId])
+  @@index([curp])
+  @@map("students")
+}
+
+// Toda obligación de pago es un Charge (sección 6.1).
+// Un Charge pertenece a una familia y opcionalmente a un alumno específico.
+model Charge {
+  id          String       @id @default(uuid()) @db.Uuid
+  tenantId    String       @map("tenant_id") @db.Uuid
+  familyId    String       @map("family_id") @db.Uuid
+  studentId   String?      @map("student_id") @db.Uuid
+  conceptType ConceptType  @map("concept_type")
+  // Descripción legible, ej. "Colegiatura Septiembre 2026, 3º de Primaria"
+  description String
+  // Monto en centavos, NUNCA flotantes (sección 6.3)
+  amountCents BigInt       @map("amount_cents")
+  currency    String       @default("MXN")
+  dueDate     DateTime     @map("due_date") @db.Date
+  status      ChargeStatus @default(SCHEDULED)
+  // Periodo que cubre, ej. "2026-09" para colegiatura mensual
+  period      String?
+  createdAt   DateTime     @default(now()) @map("created_at")
+  updatedAt   DateTime     @updatedAt @map("updated_at")
+
+  tenant       Tenant               @relation(fields: [tenantId], references: [id])
+  family       Family               @relation(fields: [familyId], references: [id])
+  student      Student?             @relation(fields: [studentId], references: [id])
+  applications PaymentApplication[]
+  invoices     Invoice[]
+
+  @@index([tenantId, status])
+  @@index([familyId, status])
+  @@index([tenantId, dueDate])
+  @@map("charges")
+}
+
+model Payment {
+  id          String        @id @default(uuid()) @db.Uuid
+  tenantId    String        @map("tenant_id") @db.Uuid
+  // Nullable: un SPEI no identificado (bandeja de aclaración) aún no tiene familia
+  familyId    String?       @map("family_id") @db.Uuid
+  amountCents BigInt        @map("amount_cents")
+  currency    String        @default("MXN")
+  method      PaymentMethod
+  provider    String? // ej. "conekta"; null para pagos manuales
+  // Referencia externa del procesador; única por procesador
+  providerPaymentId String? @map("provider_payment_id")
+  status      PaymentStatus @default(PENDING)
+  paidAt      DateTime?     @map("paid_at")
+  createdAt   DateTime      @default(now()) @map("created_at")
+  updatedAt   DateTime      @updatedAt @map("updated_at")
+
+  tenant       Tenant               @relation(fields: [tenantId], references: [id])
+  family       Family?              @relation(fields: [familyId], references: [id])
+  applications PaymentApplication[]
+  invoices     Invoice[]
+
+  @@unique([provider, providerPaymentId])
+  @@index([tenantId, status])
+  @@index([familyId])
+  @@map("payments")
+}
+
+// Ledger de aplicaciones (sección 6.1): ningún pago modifica un cargo directamente.
+// Un pago puede cubrir varios cargos; un cargo puede recibir varios pagos.
+// Correcciones por contra-asientos: amount_cents negativo con reversesId apuntando
+// al asiento original. Solo inserción; nunca UPDATE ni DELETE de asientos confirmados.
+model PaymentApplication {
+  id          String   @id @default(uuid()) @db.Uuid
+  paymentId   String   @map("payment_id") @db.Uuid
+  chargeId    String   @map("charge_id") @db.Uuid
+  amountCents BigInt   @map("amount_cents")
+  // Contra-asiento: referencia al asiento que revierte
+  reversesId  String?  @unique @map("reverses_id") @db.Uuid
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  payment    Payment             @relation(fields: [paymentId], references: [id])
+  charge     Charge              @relation(fields: [chargeId], references: [id])
+  reverses   PaymentApplication? @relation("Reversal", fields: [reversesId], references: [id])
+  reversedBy PaymentApplication? @relation("Reversal")
+
+  @@index([paymentId])
+  @@index([chargeId])
+  @@map("payment_applications")
+}
+
+// Registro crudo de todo webhook recibido (sección 7.3, paso 1 del pipeline).
+// Idempotencia garantizada por la restricción de unicidad (provider, provider_event_id).
+model PaymentEvent {
+  id              String             @id @default(uuid()) @db.Uuid
+  provider        String
+  providerEventId String             @map("provider_event_id")
+  eventType       String?            @map("event_type")
+  rawPayload      Json               @map("raw_payload")
+  status          PaymentEventStatus @default(RECEIVED)
+  errorMessage    String?            @map("error_message")
+  receivedAt      DateTime           @default(now()) @map("received_at")
+  processedAt     DateTime?          @map("processed_at")
+
+  @@unique([provider, providerEventId])
+  @@index([status])
+  @@map("payment_events")
+}
+
+// CFDI 4.0 con complemento IEDU (sección 8). Se implementa en Fase 2;
+// la entidad existe desde el MVP porque es parte del modelo obligatorio.
+model Invoice {
+  id         String        @id @default(uuid()) @db.Uuid
+  tenantId   String        @map("tenant_id") @db.Uuid
+  paymentId  String        @map("payment_id") @db.Uuid
+  chargeId   String?       @map("charge_id") @db.Uuid
+  fiscalUuid String?       @unique @map("fiscal_uuid") // UUID del SAT tras timbrado
+  xmlUrl     String?       @map("xml_url") // ruta en almacenamiento de objetos
+  pdfUrl     String?       @map("pdf_url")
+  status     InvoiceStatus @default(PENDING)
+  // RFC del pagador real (campo rfcPago del IEDU) cuando difiera del receptor
+  payerRfc   String?       @map("payer_rfc")
+  createdAt  DateTime      @default(now()) @map("created_at")
+  updatedAt  DateTime      @updatedAt @map("updated_at")
+
+  tenant  Tenant  @relation(fields: [tenantId], references: [id])
+  payment Payment @relation(fields: [paymentId], references: [id])
+  charge  Charge? @relation(fields: [chargeId], references: [id])
+
+  @@index([tenantId, status])
+  @@map("invoices")
+}
+
+// Auditoría inmutable: solo inserción, sin UPDATE ni DELETE (sección 6.1).
+// La inmutabilidad se refuerza a nivel de base de datos con un trigger
+// en la migración (ver migration.sql) y a nivel de aplicación.
+model AuditLog {
+  id         String   @id @default(uuid()) @db.Uuid
+  tenantId   String   @map("tenant_id") @db.Uuid
+  actorId    String?  @map("actor_id") // usuario o "system"
+  actorType  String   @map("actor_type") // "admin" | "guardian" | "system"
+  action     String // ej. "charge.cancelled", "payment.applied"
+  entityType String   @map("entity_type")
+  entityId   String   @map("entity_id")
+  oldValue   Json?    @map("old_value")
+  newValue   Json?    @map("new_value")
+  reason     String? // motivo obligatorio en condonaciones y cancelaciones
+  ipAddress  String?  @map("ip_address")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId, entityType, entityId])
+  @@index([tenantId, createdAt])
+  @@map("audit_logs")
+}
