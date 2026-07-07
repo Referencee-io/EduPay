@@ -1,0 +1,31 @@
+{
+  "name": "plataforma-pagos-escolares",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Plataforma de cobranza escolar con conciliación y facturación automáticas. Piloto: Instituto JFR, Querétaro.",
+  "engines": {
+    "node": ">=24.0.0",
+    "pnpm": ">=9.0.0"
+  },
+  "packageManager": "pnpm@9.15.0",
+  "scripts": {
+    "build": "pnpm -r build",
+    "lint": "eslint . --max-warnings 0",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "pnpm -r test",
+    "db:migrate": "pnpm --filter @plataforma/database migrate:dev",
+    "db:seed": "pnpm --filter @plataforma/database seed",
+    "db:studio": "pnpm --filter @plataforma/database studio",
+    "dev:infra": "docker compose up -d",
+    "dev:infra:down": "docker compose down"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.18.0",
+    "eslint": "^9.18.0",
+    "eslint-config-prettier": "^9.1.0",
+    "prettier": "^3.4.2",
+    "typescript": "^5.7.3",
+    "typescript-eslint": "^8.20.0"
+  }
+}
